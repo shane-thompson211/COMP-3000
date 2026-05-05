@@ -182,3 +182,131 @@ def feature_dict_to_vector(feat_dict):
     vec = np.array([feat_dict[f] for f in FEATURES], dtype=np.float32)
     vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
     return vec
+
+# =========================
+# CSV OUTPUT HELPERS
+# =========================
+def append_prediction_row(row: dict, path: str):
+    """
+    Append a single row to CSV.
+    If file doesn't exist, we create it and write headers first.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    file_exists = os.path.exists(path)
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def classify_and_write(flow_key, flow):
+    """
+    Convert a flow to features, classify it, and write one event row to the CSV feed.
+    """
+    feat_dict = flow_to_feature_dict(flow)
+    feats_vec = feature_dict_to_vector(feat_dict).reshape(1, -1)
+
+    # Model prediction (0/1)
+    pred = int(model.predict(feats_vec)[0])
+
+    # Probability of attack (if model supports it)
+    p_attack = None
+    if hasattr(model, "predict_proba"):
+        p_attack = float(model.predict_proba(feats_vec)[0][1])
+
+    # Severity label (simple SOC-friendly logic)
+    if pred == 0:
+        severity = "None"
+    else:
+        if p_attack is None:
+            severity = "Medium"
+        elif p_attack >= 0.95:
+            severity = "High"
+        elif p_attack >= 0.85:
+            severity = "Medium"
+        else:
+            severity = "Low"
+
+    # Flow identification
+    a_ip, a_port, b_ip, b_port, proto_num = flow_key
+    proto_str = PROTO_MAP.get(proto_num, f"OTHER({proto_num})")
+
+    # Timestamp (use flow end time)
+    ts = float(flow["end"])
+    timestamp_iso = datetime.utcfromtimestamp(ts).isoformat()
+
+    # Build a dashboard-friendly row:
+    # - SOC columns
+    # - Model outputs
+    # - PLUS the 13 features so Streamlit can plot/explain
+    row = {
+        # SOC / analyst fields
+        "timestamp": timestamp_iso,
+        "src_ip": a_ip,
+        "src_port": int(a_port),
+        "dst_ip": b_ip,
+        "dst_port": int(b_port),
+        "proto_str": proto_str,
+        "proto_num": int(proto_num),
+
+        # Model outputs (use consistent names)
+        "prediction": int(pred),  # 0 benign, 1 malicious
+        "malicious_prob": float(p_attack) if p_attack is not None else (1.0 if pred == 1 else 0.0),
+        "severity": severity,
+
+        # Include the 13 features (same names as training)
+        **feat_dict,
+    }
+
+    append_prediction_row(row, OUTPUT_CSV)
+
+
+def sweep_timeouts(now):
+    """
+    Classify and remove flows inactive for longer than FLOW_TIMEOUT.
+    """
+    for key, flow in list(flows.items()):
+        if (now - flow["end"]) > FLOW_TIMEOUT:
+            classify_and_write(key, flow)
+            del flows[key]
+
+
+# =========================
+# MAIN
+# =========================
+print(f"Opening PCAP: {PCAP_FILE}")
+count = 0
+last_now = None
+
+with PcapReader(PCAP_FILE) as pcap:
+    print("Processing packets...")
+    for pkt in pcap:
+        count += 1
+        if count > MAX_PACKETS_TO_PROCESS:
+            print(f"Reached MAX_PACKETS_TO_PROCESS={MAX_PACKETS_TO_PROCESS}")
+            break
+
+        try:
+            # Only track IP + TCP/UDP packets
+            if IP in pkt and (TCP in pkt or UDP in pkt):
+                update_flow(pkt)
+                last_now = float(pkt.time)
+                sweep_timeouts(last_now)
+        except Exception:
+            # Ignore malformed packets / edge errors
+            continue
+
+        if count % 5000 == 0:
+            print(f"  ...processed {count} packets | active flows={len(flows)}")
+
+print("\n--- Final Flush (classifying remaining flows) ---")
+if last_now is None:
+    last_now = 0.0
+
+for key, flow in list(flows.items()):
+    classify_and_write(key, flow)
+    del flows[key]
+
+print(f"Done. IDS feed written to: {OUTPUT_CSV}")
